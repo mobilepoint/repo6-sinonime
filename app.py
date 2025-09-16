@@ -1,4 +1,4 @@
-# app.py — Admin aliasuri SKU (căutare în tabel, adăugare/ștergere; clear input după adăugare)
+# app.py — Admin aliasuri SKU (select din tabel, add/remove alias; clear input robust)
 import re
 from decimal import Decimal, InvalidOperation
 
@@ -23,6 +23,17 @@ if not SUPABASE_URL or not SUPABASE_ANON:
     st.stop()
 
 client = create_client(SUPABASE_URL, SUPABASE_ANON)
+
+# =========================
+#   STATE HELPERS
+# =========================
+if "selected_row_key" not in st.session_state:
+    st.session_state["selected_row_key"] = None
+if "input_nonce" not in st.session_state:
+    st.session_state["input_nonce"] = 0  # schimbă cheia widget-ului pentru clear
+
+def bump_input_nonce():
+    st.session_state["input_nonce"] += 1
 
 # =========================
 #   HELPERS
@@ -85,14 +96,14 @@ left, right = st.columns([2, 3], gap="large")
 
 with left:
     st.subheader("Rezultate")
-    # pregătim tabelul pentru selecție directă (checkbox pe rând)
+    # tabel pentru selecție (checkbox pe rând)
     view_df = df[["name", "primary_sku"]].copy()
     view_df.insert(0, "selectează", False)
 
-    # dacă există o selecție anterioară în session_state, o păstrăm
-    if "selected_row_key" in st.session_state and st.session_state["selected_row_key"] in df.index:
-        sel_idx = st.session_state["selected_row_key"]
-        view_df.loc[sel_idx, "selectează"] = True
+    # păstrăm selecția anterioară
+    sel_idx_prev = st.session_state.get("selected_row_key")
+    if sel_idx_prev in df.index:
+        view_df.loc[sel_idx_prev, "selectează"] = True
 
     edited = st.data_editor(
         view_df,
@@ -111,18 +122,17 @@ with left:
     # determinăm rândul selectat (impunem SINGLE select)
     selected_rows = [i for i, v in edited["selectează"].items() if v]
     if len(selected_rows) > 1:
-        # dacă au bifat mai multe, păstrăm primul și curățăm restul în state la următorul rerun
         keep = selected_rows[0]
         st.warning("Te rog selectează un singur rând. Îl folosesc pe primul bifat.")
         st.session_state["selected_row_key"] = keep
     elif len(selected_rows) == 1:
         st.session_state["selected_row_key"] = selected_rows[0]
     else:
-        st.session_state.pop("selected_row_key", None)
+        st.session_state["selected_row_key"] = None
 
-    # afișăm status selecție
-    if "selected_row_key" in st.session_state:
-        chosen_idx = st.session_state["selected_row_key"]
+    # status selecție
+    chosen_idx = st.session_state["selected_row_key"]
+    if chosen_idx is not None:
         chosen_row = df.loc[chosen_idx]
         product_id = chosen_row["product_id"]
         name = chosen_row["name"]
@@ -134,7 +144,7 @@ with left:
 
 with right:
     st.subheader("Detalii produs")
-    if not product_id:
+    if product_id is None:
         st.info("Selectează un produs din tabelul din stânga.")
         st.stop()
 
@@ -151,9 +161,11 @@ with right:
 
     # ===== ADĂUGARE ALIASURI =====
     st.markdown("### ➕ Adaugă aliasuri noi")
+
+    ta_key = f"add_alias_input_{st.session_state['input_nonce']}"
     raw = st.text_area(
         "SKU-uri de adăugat (separate prin virgulă sau pe linii diferite)",
-        key="add_alias_input",
+        key=ta_key,
         placeholder="ex:\nGH97-18767C\n560610000000, 560610000001"
     )
 
@@ -164,11 +176,10 @@ with right:
         st.caption("Aliasurile se leagă de produs și sunt marcate `is_primary = false`. Notația științifică e suportată.")
 
     if btn_add:
-        raw_text = (st.session_state.get("add_alias_input") or "").strip()
+        raw_text = (raw or "").strip()
         if not raw_text:
             st.warning("Introdu cel puțin un cod.")
         else:
-            # parse + canonize + unice + exclude deja existente
             candidates = []
             for piece in re.split(r"[,;\n]+", raw_text):
                 s = canon_sku(piece)
@@ -195,8 +206,8 @@ with right:
 
                 if ok:
                     st.success(f"Adăugate: {', '.join(ok)}")
-                    # CLEAR INPUT după succes
-                    st.session_state["add_alias_input"] = ""
+                    # CLEAR INPUT: schimbăm cheia widget-ului și re-rulăm
+                    bump_input_nonce()
                 if fail:
                     st.error("Eșec la:")
                     for sku, msg in fail:
@@ -204,7 +215,7 @@ with right:
 
                 if ok and not fail:
                     fetch_products.clear()
-                    st.rerun()
+                st.rerun()
 
     st.markdown("---")
 
@@ -247,4 +258,4 @@ with right:
 
                 if ok and not fail:
                     fetch_products.clear()
-                    st.rerun()
+                st.rerun()
