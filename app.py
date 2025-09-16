@@ -1,4 +1,4 @@
-# app.py — Admin aliasuri SKU (căutare după nume, adăugare și ștergere)
+# app.py — Admin aliasuri SKU (căutare în tabel, adăugare/ștergere; clear input după adăugare)
 import re
 from decimal import Decimal, InvalidOperation
 
@@ -85,22 +85,62 @@ left, right = st.columns([2, 3], gap="large")
 
 with left:
     st.subheader("Rezultate")
-    st.dataframe(df[["name", "primary_sku"]], use_container_width=True, hide_index=True, height=320)
+    # pregătim tabelul pentru selecție directă (checkbox pe rând)
+    view_df = df[["name", "primary_sku"]].copy()
+    view_df.insert(0, "selectează", False)
 
-    options = {f"{row['name']}  —  {row['primary_sku']}": idx for idx, row in df.reset_index().iterrows()}
-    choice = st.selectbox("Selectează produsul", list(options.keys()))
-    row = df.iloc[options[choice]]
-    product_id = row["product_id"]
-    name = row["name"]
-    primary = row["primary_sku"]
-    aliases = sorted([s for s in row["all_skus"] if s != primary])
+    # dacă există o selecție anterioară în session_state, o păstrăm
+    if "selected_row_key" in st.session_state and st.session_state["selected_row_key"] in df.index:
+        sel_idx = st.session_state["selected_row_key"]
+        view_df.loc[sel_idx, "selectează"] = True
+
+    edited = st.data_editor(
+        view_df,
+        key="results_editor",
+        use_container_width=True,
+        hide_index=False,
+        height=360,
+        column_config={
+            "selectează": st.column_config.CheckboxColumn(required=False, help="Bifează un singur produs"),
+            "name": st.column_config.TextColumn("Nume produs"),
+            "primary_sku": st.column_config.TextColumn("SKU principal"),
+        },
+        disabled=["name", "primary_sku"],
+    )
+
+    # determinăm rândul selectat (impunem SINGLE select)
+    selected_rows = [i for i, v in edited["selectează"].items() if v]
+    if len(selected_rows) > 1:
+        # dacă au bifat mai multe, păstrăm primul și curățăm restul în state la următorul rerun
+        keep = selected_rows[0]
+        st.warning("Te rog selectează un singur rând. Îl folosesc pe primul bifat.")
+        st.session_state["selected_row_key"] = keep
+    elif len(selected_rows) == 1:
+        st.session_state["selected_row_key"] = selected_rows[0]
+    else:
+        st.session_state.pop("selected_row_key", None)
+
+    # afișăm status selecție
+    if "selected_row_key" in st.session_state:
+        chosen_idx = st.session_state["selected_row_key"]
+        chosen_row = df.loc[chosen_idx]
+        product_id = chosen_row["product_id"]
+        name = chosen_row["name"]
+        primary = chosen_row["primary_sku"]
+        aliases = sorted([s for s in chosen_row["all_skus"] if s != primary])
+    else:
+        product_id = name = primary = None
+        aliases = []
 
 with right:
     st.subheader("Detalii produs")
+    if not product_id:
+        st.info("Selectează un produs din tabelul din stânga.")
+        st.stop()
+
     st.markdown(f"**Nume:** {name}")
     st.markdown(f"**SKU principal:** `{primary}`")
 
-    # ===== LISTĂ ALIASURI =====
     st.markdown("**Aliasuri existente:**")
     if aliases:
         st.code(", ".join(aliases), language="text")
@@ -111,8 +151,11 @@ with right:
 
     # ===== ADĂUGARE ALIASURI =====
     st.markdown("### ➕ Adaugă aliasuri noi")
-    raw = st.text_area("SKU-uri de adăugat (separate prin virgulă sau pe linii diferite)", 
-                       placeholder="ex:\nGH97-18767C\n560610000000, 560610000001")
+    raw = st.text_area(
+        "SKU-uri de adăugat (separate prin virgulă sau pe linii diferite)",
+        key="add_alias_input",
+        placeholder="ex:\nGH97-18767C\n560610000000, 560610000001"
+    )
 
     add_col1, add_col2 = st.columns([1, 3])
     with add_col1:
@@ -120,41 +163,48 @@ with right:
     with add_col2:
         st.caption("Aliasurile se leagă de produs și sunt marcate `is_primary = false`. Notația științifică e suportată.")
 
-    if btn_add and raw.strip():
-        candidates = []
-        for piece in re.split(r"[,;\n]+", raw):
-            s = canon_sku(piece)
-            if s:
-                candidates.append(s)
-        to_add = sorted(set(candidates) - set(row["all_skus"]))
-
-        if not to_add:
-            st.warning("Nimic de adăugat: toate SKU-urile sunt deja asociate.")
+    if btn_add:
+        raw_text = (st.session_state.get("add_alias_input") or "").strip()
+        if not raw_text:
+            st.warning("Introdu cel puțin un cod.")
         else:
-            ok, fail = [], []
-            st.info(f"Încerc să adaug {len(to_add)} alias(uri)…")
-            for sku in to_add:
-                try:
-                    resp = rpc_add_alias(product_id, sku)
-                    if getattr(resp, "error", None):
-                        fail.append((sku, str(resp.error)))
-                    elif not getattr(resp, "data", None):
-                        fail.append((sku, "RPC a răspuns fără date"))
-                    else:
-                        ok.append(sku)
-                except Exception as e:
-                    fail.append((sku, repr(e)))
+            # parse + canonize + unice + exclude deja existente
+            candidates = []
+            for piece in re.split(r"[,;\n]+", raw_text):
+                s = canon_sku(piece)
+                if s:
+                    candidates.append(s)
+            to_add = sorted(set(candidates) - set(aliases) - {primary})
 
-            if ok:
-                st.success(f"Adăugate: {', '.join(ok)}")
-            if fail:
-                st.error("Eșec la:")
-                for sku, msg in fail:
-                    st.write(f"- `{sku}` → {msg}")
+            if not to_add:
+                st.warning("Nimic de adăugat: toate SKU-urile există deja (alias sau principal).")
+            else:
+                ok, fail = [], []
+                st.info(f"Încerc să adaug {len(to_add)} alias(uri)…")
+                for sku in to_add:
+                    try:
+                        resp = rpc_add_alias(product_id, sku)
+                        if getattr(resp, "error", None):
+                            fail.append((sku, str(resp.error)))
+                        elif not getattr(resp, "data", None):
+                            fail.append((sku, "RPC a răspuns fără date"))
+                        else:
+                            ok.append(sku)
+                    except Exception as e:
+                        fail.append((sku, repr(e)))
 
-            if ok and not fail:
-                fetch_products.clear()
-                st.rerun()
+                if ok:
+                    st.success(f"Adăugate: {', '.join(ok)}")
+                    # CLEAR INPUT după succes
+                    st.session_state["add_alias_input"] = ""
+                if fail:
+                    st.error("Eșec la:")
+                    for sku, msg in fail:
+                        st.write(f"- `{sku}` → {msg}")
+
+                if ok and not fail:
+                    fetch_products.clear()
+                    st.rerun()
 
     st.markdown("---")
 
@@ -182,7 +232,6 @@ with right:
                         if getattr(resp, "error", None):
                             fail.append((sku, str(resp.error)))
                         elif not getattr(resp, "data", None):
-                            # dacă nu a returnat rând (poate nu exista)
                             fail.append((sku, "Nu s-a șters niciun rând (poate nu exista)"))
                         else:
                             ok.append(sku)
