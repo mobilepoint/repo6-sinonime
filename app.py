@@ -1,165 +1,148 @@
+import re
+from decimal import Decimal, InvalidOperation
+
+import pandas as pd
 import streamlit as st
 from supabase import create_client
-import pandas as pd
 
-st.set_page_config(page_title="SKU Sinonime — ServicePack", page_icon="🔎", layout="centered")
+# =========================
+#   CONFIG
+# =========================
+st.set_page_config(page_title="Admin aliasuri SKU", layout="wide")
+st.title("Admin aliasuri SKU (Supabase)")
 
-# --- Supabase client ---
-@st.cache_resource
-def get_client():
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["anon_key"]
-    return create_client(url, key)
+# =========================
+#   SECRETS (Supabase)
+# =========================
+sb = st.secrets.get("supabase", {})
+SUPABASE_URL = sb.get("url", "")
+SUPABASE_ANON = sb.get("anon_key", "")
+if not SUPABASE_URL or not SUPABASE_ANON:
+    st.error("Lipsește [supabase] în Secrets. Exemplu:\n\n[supabase]\nurl = \"https://<proj>.supabase.co\"\nanon_key = \"<ANON>\"")
+    st.stop()
 
-sb = get_client()
+client = create_client(SUPABASE_URL, SUPABASE_ANON)
 
-TABLE = "sku_sinonime"
-COL_ALT = '"COD ALTERNATIV"'
-COL_MAIN = '"COD PRINCIPAL"'
-COL_NAME = '"NUME"'
-
-st.title("🔎 Gestionare sinonime SKU")
-st.caption("Caută după **COD PRINCIPAL**, vezi aliasuri și adaugă rapid coduri alternative. Numele se completează automat.")
-
-# --- Helpers ---
-def norm(s: str) -> str:
-    if s is None:
+# =========================
+#   HELPERS
+# =========================
+def canon_sku(x: str) -> str:
+    """curăță spații, convertește 5.6061E+11 -> 560610000000"""
+    if x is None:
         return ""
-    return (
-        s.replace("\u00A0", " ")   # NBSP -> spatiu normal
-         .replace("\u200B", "")   # zero-width space
-         .strip()
-         .upper()
-    )
+    s = str(x).strip().replace(" ", "")
+    if s == "":
+        return ""
+    if re.match(r"^[0-9]+(\.[0-9]+)?[eE]\+[0-9]+$", s):
+        try:
+            d = Decimal(s)
+            s = format(d, 'f').replace(".", "")
+        except InvalidOperation:
+            pass
+    return s
 
-def get_nume_for_principal(cod_principal: str):
-    res = (
-        sb.table(TABLE)
-        .select(COL_NAME)
-        .filter(COL_MAIN, "eq", cod_principal)
-        .limit(1)
-        .execute()
-    )
-    if res.data:
-        return res.data[0]["NUME"]
-    return None
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_products(q: str | None):
+    """Citește din view-ul public.v_aliases_by_product; filtrează după nume dacă e cazul."""
+    rng = 1000
+    start = 0
+    rows = []
+    while True:
+        sel = client.table("v_aliases_by_product").select("*")
+        if q:
+            sel = sel.ilike("name", f"%{q}%")
+        resp = sel.order("name").range(start, start + rng - 1).execute()
+        data = resp.data or []
+        rows.extend(data)
+        if len(data) < rng:
+            break
+        start += rng
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["product_id", "name", "primary_sku", "all_skus"])
+    # normalizare all_skus -> list
+    if "all_skus" in df.columns:
+        df["all_skus"] = df["all_skus"].apply(lambda v: v if isinstance(v, list) else [])
+    return df
 
-def get_aliases(cod_principal: str):
-    res = (
-        sb.table(TABLE)
-        .select(f"{COL_ALT},{COL_MAIN},{COL_NAME}")
-        .filter(COL_MAIN, "eq", cod_principal)
-        .order(COL_ALT)
-        .execute()
-    )
-    return res.data or []
+def add_alias(product_id: str, new_sku: str):
+    """Apelează RPC-ul public.add_alias_sku."""
+    return client.rpc("add_alias_sku", {"p_product_id": product_id, "p_sku": new_sku}).execute()
 
-def alt_exists(alt_code: str) -> bool:
-    res = (
-        sb.table(TABLE)
-        .select(COL_ALT)
-        .filter(COL_ALT, "eq", alt_code)
-        .limit(1)
-        .execute()
-    )
-    return bool(res.data)
+# =========================
+#   UI
+# =========================
+search = st.text_input("Caută produs după nume", placeholder="ex: iPhone 11, G935 GOLD, etc.")
+df = fetch_products(search.strip() or None)
 
-# --- UI ---
-with st.form("search_form", clear_on_submit=False):
-    cod_principal_input = st.text_input("COD PRINCIPAL", placeholder="ex: 02351QCY").strip()
-    submitted = st.form_submit_button("Caută")
-    if submitted and not cod_principal_input:
-        st.warning("Completează COD PRINCIPAL.")
-        st.stop()
+if df.empty:
+    st.info("N-am găsit produse pentru criteriul de căutare.")
+    st.stop()
 
-if cod_principal_input:
-    cod_principal = norm(cod_principal_input)
-    st.subheader(f"Rezultate pentru: `{cod_principal}`")
+# listă selectabilă
+left, right = st.columns([2, 3], gap="large")
 
-    # Afișează sinonimele existente
-    rows = get_aliases(cod_principal)
-    if rows:
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        nume_ref = rows[0]["NUME"]
+with left:
+    st.subheader("Rezultate")
+    # tabel scurt
+    st.dataframe(df[["name", "primary_sku"]], use_container_width=True, hide_index=True, height=300)
+
+    # selector produs
+    options = {f"{row['name']}  —  {row['primary_sku']}": idx for idx, row in df.reset_index().iterrows()}
+    choice = st.selectbox("Selectează produsul", list(options.keys()))
+    row = df.iloc[options[choice]]
+    product_id = row["product_id"]
+    name = row["name"]
+    primary = row["primary_sku"]
+    aliases = sorted([s for s in row["all_skus"] if s != primary])
+
+with right:
+    st.subheader("Detalii produs")
+    st.markdown(f"**Nume:** {name}")
+    st.markdown(f"**SKU principal:** `{primary}`")
+
+    st.markdown("**Aliasuri existente:**")
+    if aliases:
+        st.code(", ".join(aliases), language="text")
     else:
-        nume_ref = get_nume_for_principal(cod_principal)
-        st.info("Nu există încă rânduri pentru acest COD PRINCIPAL. Poți adăuga unul nou mai jos.")
+        st.info("Nu există aliasuri pentru acest produs.")
 
-    # Adăugare coduri alternative
-    st.markdown("### ➕ Adaugă coduri alternative")
-    new_codes_raw = st.text_area(
-        "Coduri alternative (separate prin virgulă sau pe linii noi)",
-        placeholder="ALT001, ALT002\nALT003"
-    )
+    st.markdown("---")
+    st.markdown("**Adaugă aliasuri noi** (separate prin virgulă sau pe linii diferite)")
+    raw = st.text_area("SKU-uri de adăugat", placeholder="ex:\nGH97-18767C\n560610000000, 560610000001")
 
-    if st.button("Adaugă acum"):
-        if not new_codes_raw.strip():
-            st.warning("Introdu cel puțin un cod alternativ.")
+    colb1, colb2 = st.columns([1, 3])
+    with colb1:
+        btn = st.button("➕ Adaugă", type="primary")
+    with colb2:
+        st.caption("La insert, aliasurile se vor lega de produs și vor fi marcate `is_primary = false`.")
+
+    if btn and raw.strip():
+        # parse + canonize + unice + exclude deja existente
+        candidates = []
+        for piece in re.split(r"[,;\n]+", raw):
+            s = canon_sku(piece)
+            if s:
+                candidates.append(s)
+        to_add = sorted(set(candidates) - set(row["all_skus"]))
+
+        if not to_add:
+            st.warning("Nimic de adăugat: toate SKU-urile sunt deja asociate.")
         else:
-            # Normalizează lista
-            parts = [norm(x) for x in new_codes_raw.replace(",", "\n").split("\n")]
-            new_codes = [x for x in parts if x]
-
-            # Asigură NUME (dintr-un rând existent)
-            nume = nume_ref or get_nume_for_principal(cod_principal)
-            if not nume:
-                # Dacă nu există încă nume pentru principal, cere-l de la utilizator și creează rândul de referință
-                st.warning("Nu am găsit denumirea produsului pentru acest COD PRINCIPAL.")
-                nume = st.text_input("Introdu denumirea produsului (NUME) pentru a crea rândul de referință").strip()
-                if not nume:
-                    st.stop()
-
-            inserted, skipped = [], []
-
-            # Seed rând de referință dacă lipsesc rânduri pentru principal (ALT=PRINCIPAL)
-            if not rows:
+            ok, fail = [], []
+            for sku in to_add:
                 try:
-                    sb.table(TABLE).insert({
-                        "COD ALTERNATIV": cod_principal,
-                        "COD PRINCIPAL": cod_principal,
-                        "NUME": nume
-                    }).execute()
-                except Exception:
-                    # e posibil să existe deja
-                    pass
-
-            # Inserare coduri alternative
-            for alt in new_codes:
-                if alt == cod_principal or alt_exists(alt):
-                    skipped.append(alt)
-                    continue
-                payload = {
-                    "COD ALTERNATIV": alt,
-                    "COD PRINCIPAL": cod_principal,
-                    "NUME": nume
-                }
-                try:
-                    sb.table(TABLE).insert(payload).execute()
-                    inserted.append(alt)
+                    resp = add_alias(product_id, sku)
+                    # resp.data conține rândul inserat/upsertat
+                    ok.append(sku)
                 except Exception as e:
-                    st.error(f"Eroare la inserarea {alt}: {e}")
+                    fail.append((sku, str(e)))
 
-            if inserted:
-                st.success(f"Adăugate: {', '.join(inserted)}")
-            if skipped:
-                st.info(f"Sărite (existente/identice cu principal): {', '.join(skipped)}")
+            if ok:
+                st.success(f"Adăugate: {', '.join(ok)}")
+            if fail:
+                st.error("Eșec la: " + "; ".join([f"{s} ({msg})" for s, msg in fail]))
 
-            # Refresh tabel
-            rows = get_aliases(cod_principal)
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    # Ștergere simplă
-    st.divider()
-    st.markdown("### 🗑️ Șterge un cod alternativ")
-    del_alt = st.text_input("Cod alternativ de șters", placeholder="ALT001").strip()
-    if st.button("Șterge"):
-        del_alt_n = norm(del_alt)
-        if not del_alt_n:
-            st.warning("Completează codul alternativ.")
-        elif del_alt_n == cod_principal:
-            st.warning("Nu poți șterge rândul de referință (ALT=PRINCIPAL).")
-        else:
-            sb.table(TABLE).delete().filter(COL_ALT, "eq", del_alt_n).execute()
-            st.success(f"Șters: {del_alt_n}")
+            # refresh cache și UI
+            fetch_products.clear()
+            st.rerun()
