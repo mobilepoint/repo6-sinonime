@@ -1,3 +1,4 @@
+# app.py — Admin aliasuri SKU (căutare după nume, adăugare și ștergere)
 import re
 from decimal import Decimal, InvalidOperation
 
@@ -9,7 +10,7 @@ from supabase import create_client
 #   CONFIG
 # =========================
 st.set_page_config(page_title="Admin aliasuri SKU", layout="wide")
-st.title("Admin aliasuri SKU (Supabase)")
+st.title("Admin aliasuri SKU")
 
 # =========================
 #   SECRETS (Supabase)
@@ -27,7 +28,7 @@ client = create_client(SUPABASE_URL, SUPABASE_ANON)
 #   HELPERS
 # =========================
 def canon_sku(x: str) -> str:
-    """curăță spații, convertește 5.6061E+11 -> 560610000000"""
+    """Curăță spații, convertește 5.6061E+11 -> 560610000000."""
     if x is None:
         return ""
     s = str(x).strip().replace(" ", "")
@@ -60,34 +61,32 @@ def fetch_products(q: str | None):
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["product_id", "name", "primary_sku", "all_skus"])
-    # normalizare all_skus -> list
     if "all_skus" in df.columns:
         df["all_skus"] = df["all_skus"].apply(lambda v: v if isinstance(v, list) else [])
     return df
 
-def add_alias(product_id: str, new_sku: str):
-    """Apelează RPC-ul public.add_alias_sku."""
+def rpc_add_alias(product_id: str, new_sku: str):
     return client.rpc("add_alias_sku", {"p_product_id": product_id, "p_sku": new_sku}).execute()
+
+def rpc_remove_alias(product_id: str, sku: str):
+    return client.rpc("remove_alias_sku", {"p_product_id": product_id, "p_sku": sku}).execute()
 
 # =========================
 #   UI
 # =========================
-search = st.text_input("Caută produs după nume", placeholder="ex: iPhone 11, G935 GOLD, etc.")
-df = fetch_products(search.strip() or None)
+search = st.text_input("Caută produs după nume", placeholder="ex: iPhone 11, G935 GOLD, etc.").strip()
+df = fetch_products(search or None)
 
 if df.empty:
     st.info("N-am găsit produse pentru criteriul de căutare.")
     st.stop()
 
-# listă selectabilă
 left, right = st.columns([2, 3], gap="large")
 
 with left:
     st.subheader("Rezultate")
-    # tabel scurt
-    st.dataframe(df[["name", "primary_sku"]], use_container_width=True, hide_index=True, height=300)
+    st.dataframe(df[["name", "primary_sku"]], use_container_width=True, hide_index=True, height=320)
 
-    # selector produs
     options = {f"{row['name']}  —  {row['primary_sku']}": idx for idx, row in df.reset_index().iterrows()}
     choice = st.selectbox("Selectează produsul", list(options.keys()))
     row = df.iloc[options[choice]]
@@ -101,6 +100,7 @@ with right:
     st.markdown(f"**Nume:** {name}")
     st.markdown(f"**SKU principal:** `{primary}`")
 
+    # ===== LISTĂ ALIASURI =====
     st.markdown("**Aliasuri existente:**")
     if aliases:
         st.code(", ".join(aliases), language="text")
@@ -108,17 +108,19 @@ with right:
         st.info("Nu există aliasuri pentru acest produs.")
 
     st.markdown("---")
-    st.markdown("**Adaugă aliasuri noi** (separate prin virgulă sau pe linii diferite)")
-    raw = st.text_area("SKU-uri de adăugat", placeholder="ex:\nGH97-18767C\n560610000000, 560610000001")
 
-    colb1, colb2 = st.columns([1, 3])
-    with colb1:
-        btn = st.button("➕ Adaugă", type="primary")
-    with colb2:
-        st.caption("La insert, aliasurile se vor lega de produs și vor fi marcate `is_primary = false`.")
+    # ===== ADĂUGARE ALIASURI =====
+    st.markdown("### ➕ Adaugă aliasuri noi")
+    raw = st.text_area("SKU-uri de adăugat (separate prin virgulă sau pe linii diferite)", 
+                       placeholder="ex:\nGH97-18767C\n560610000000, 560610000001")
 
-    if btn and raw.strip():
-        # parse + canonize + unice + exclude deja existente
+    add_col1, add_col2 = st.columns([1, 3])
+    with add_col1:
+        btn_add = st.button("Adaugă", type="primary")
+    with add_col2:
+        st.caption("Aliasurile se leagă de produs și sunt marcate `is_primary = false`. Notația științifică e suportată.")
+
+    if btn_add and raw.strip():
         candidates = []
         for piece in re.split(r"[,;\n]+", raw):
             s = canon_sku(piece)
@@ -130,19 +132,70 @@ with right:
             st.warning("Nimic de adăugat: toate SKU-urile sunt deja asociate.")
         else:
             ok, fail = [], []
+            st.info(f"Încerc să adaug {len(to_add)} alias(uri)…")
             for sku in to_add:
                 try:
-                    resp = add_alias(product_id, sku)
-                    # resp.data conține rândul inserat/upsertat
-                    ok.append(sku)
+                    resp = rpc_add_alias(product_id, sku)
+                    if getattr(resp, "error", None):
+                        fail.append((sku, str(resp.error)))
+                    elif not getattr(resp, "data", None):
+                        fail.append((sku, "RPC a răspuns fără date"))
+                    else:
+                        ok.append(sku)
                 except Exception as e:
-                    fail.append((sku, str(e)))
+                    fail.append((sku, repr(e)))
 
             if ok:
                 st.success(f"Adăugate: {', '.join(ok)}")
             if fail:
-                st.error("Eșec la: " + "; ".join([f"{s} ({msg})" for s, msg in fail]))
+                st.error("Eșec la:")
+                for sku, msg in fail:
+                    st.write(f"- `{sku}` → {msg}")
 
-            # refresh cache și UI
-            fetch_products.clear()
-            st.rerun()
+            if ok and not fail:
+                fetch_products.clear()
+                st.rerun()
+
+    st.markdown("---")
+
+    # ===== ȘTERGERE ALIASURI =====
+    st.markdown("### 🗑️ Șterge aliasuri")
+    if not aliases:
+        st.caption("Nu ai aliasuri de șters.")
+    else:
+        sel_to_remove = st.multiselect("Alege aliasurile de șters", options=aliases, placeholder="Selectează unul sau mai multe")
+        danger = st.checkbox("Confirm că știu ce fac (nu pot șterge SKU principal)", value=False)
+        colr1, colr2 = st.columns([1, 3])
+        with colr1:
+            btn_remove = st.button("Șterge selectate", disabled=not danger)
+        with colr2:
+            st.caption("Nu se va permite ștergerea SKU-ului principal. Operația afectează doar aliasurile.")
+
+        if btn_remove:
+            if not sel_to_remove:
+                st.warning("Selectează măcar un alias.")
+            else:
+                ok, fail = [], []
+                for sku in sel_to_remove:
+                    try:
+                        resp = rpc_remove_alias(product_id, sku)
+                        if getattr(resp, "error", None):
+                            fail.append((sku, str(resp.error)))
+                        elif not getattr(resp, "data", None):
+                            # dacă nu a returnat rând (poate nu exista)
+                            fail.append((sku, "Nu s-a șters niciun rând (poate nu exista)"))
+                        else:
+                            ok.append(sku)
+                    except Exception as e:
+                        fail.append((sku, repr(e)))
+
+                if ok:
+                    st.success(f"Șterse: {', '.join(ok)}")
+                if fail:
+                    st.error("Eșec la:")
+                    for sku, msg in fail:
+                        st.write(f"- `{sku}` → {msg}")
+
+                if ok and not fail:
+                    fetch_products.clear()
+                    st.rerun()
